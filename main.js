@@ -36,8 +36,9 @@ function checkPath(p) {
   if (found) { return out; }
   return '';
 }
-function findApi(nn) {
+function findApi(nn, spath) {
   let p, n = nn.replace(/(\.\.|\\|\/)/g, '');
+  if ((p = checkPath(`${spath}/service/api/${n}.js`)) != '') { return p; }
   if ((p = checkPath(`${cwd}/service/api/${n}.js`)) != '') { return p; }
   if ((p = checkPath(`${__dirname}/../../services/api/${n}.js`)) != '') { return p; }
   let statCache = {}, exts = glob.sync(`${cwd}/extensions/*`, { stat: true, statCache });
@@ -47,8 +48,10 @@ function findApi(nn) {
   }
   return '';
 }
-function findApiExt(nn, ee) {
+function findApiExt(nn, ee, spath) {
   let p, n = nn.replace(/(\.\.|\\|\/)/g, ''), e = ee.replace(/(\.\.|\\|\/)/g, '');
+  if ((p = checkPath(`${spath}/services/api/${n}-${e}.js`)) != '') { return p; }
+  if ((p = checkPath(`${spath}/services/api/_${e}.js`)) != '') { return p; }
   if ((p = checkPath(`${cwd}/services/api/${n}-${e}.js`)) != '') { return p; }
   if ((p = checkPath(`${cwd}/services/api/_${e}.js`)) != '') { return p; }
   if ((p = checkPath(`${__dirname}/../../services/api/${n}-${e}.js`)) != '') { return p; }
@@ -60,6 +63,14 @@ function findApiExt(nn, ee) {
     if ((p = checkPath(`${exts[i]}/services/api/_${e}.js`)) != '') { return p; }
   }
   return '';
+}
+class extendedApiBaseClass {
+  constructor(p) { this._events = []; this.p = p; }
+  on(n, f) { this._events.push({ n, f }); this.p.on(n, f); }
+  off(n, f) {
+    for (let i = 0, e = this._events, l = e.length; i < l; i++) { if ((e[i].n == n) && (e[i].f == f)) { e.splice(i, 1); i--; l--; } }
+    this.p.off(n, f);
+  }
 }
 class serviceEmitter extends EventEmitter {
   constructor(con) {
@@ -73,16 +84,14 @@ class serviceEmitter extends EventEmitter {
     this.socket = (con ? con : undefined);
   }
   init(sn, o) {
-    let keep;
+    let keep, port = 0;
     if ((typeof o === 'boolean') || (o instanceof Boolean)) { keep = !!o; }
-    else { keep = !!o.keep; }
+    else { keep = !!o.keep; port = o.port||0; }
     this.connections = { _count: 0 };
     let sockClosed = (k) => {
       if (k.ceFired) { return; }
       k.ceFired = true;
       k.emit('disconnected');
-      if (this.connections[k.id]) { delete this.connections[k.id]; this.connections._count--; }
-      if ((this.connections._count == 0) && (!keep)) { this.exit(); }
     };
     this.type = sn;
     this.server = net.createServer((c) => {
@@ -98,10 +107,16 @@ class serviceEmitter extends EventEmitter {
       k.fromServer = true;
       k.server = this;
       this.connections._count++;
-      k.on('disconnected', function () { let { id, server: { connections: cons } } = this; if (!cons[id]) { return; } delete cons[id]; cons._count--; });
+      k.on('disconnected', function () {
+        let { id, server: { connections: cons } } = this;
+        if (!cons[id]) { return; }
+        delete cons[id];
+        cons._count--;
+        if ((cons._count == 0) && (!keep)) { this.exit(); }
+      });
       c.write(JSON.stringify({ type: 'init', data: {} }), 'utf8', () => { debugPrint('sent init'); });
     });
-    this.server.listen(0, () => { if (noProcess) { return; } process.send({ type: 'port', port: this.port }); });
+    this.server.listen(port, () => { if (noProcess) { return; } process.send({ type: 'port', port: this.port }); });
     this.port = this.server.address().port;
     if (!noProcess) { process.on('message', this.PL = (m) => this.processListener(m)); }
   }
@@ -112,7 +127,8 @@ class serviceEmitter extends EventEmitter {
     this.isP = false;
     if (sn.port) { s = sn.name; p = sn.port; this.isP = true; }
     else { // FIXME add other search paths
-      p = `${cwd}/services/ports/${s}.port`;
+      if (sn.servicePath) { s = sn.name; this.servicePath = reparsePath(sn.servicePath); }
+      p = `${this.servicePath||cwd}/services/ports/${s}.port`;
       if (!fs.existsSync(p)) { debugPrint('cwd failed'); }
       debugPrint(p);
       try { p = parseInt(fs.readFileSync(p, 'utf8').toString()); }
@@ -145,13 +161,12 @@ class serviceEmitter extends EventEmitter {
     return false;
   }
   setIdentifier(id) { this.id = id; }
-  // { id: eventId, event: 'event name', data: {}, replyExpected: true/false }
-  // m = { event: 'event name', data: {}, callback: () => {}, replyExpected: true/false }
+  // { id: eventId, event: 'event name', data: {} }
+  // m = { event: 'event name', data: {}, callback: () => {} }
   send(m) {
     let hid = serviceEmitter.ids++, p;
-    if ((m.replyExpected) && (!m.callback)) { m.replyExpected = false; }
     if (m.callback) { this.eventHandlers[`__reply_${hid}`] = (...args) => m.callback.call(this, ...args); }
-    p = JSON.stringify({ type: 'msg', event: m.event, id: hid, data: m.data, replyExpected: !!m.replyExpected });
+    p = JSON.stringify({ type: 'msg', event: m.event, id: hid, data: m.data });
     this.socket.write(p, 'utf8', () => { });
   }
   disconnect() { if (!this.isConnected) { return; } this.isConnected = false; this.socket.end(); }
@@ -164,7 +179,7 @@ class serviceEmitter extends EventEmitter {
     process.send({ type: 'stop' });
   }
   loadApi() {
-    let p = findApi(this.type), o;
+    let p = findApi(this.type, this.servicePath), o;
     if (!p) { debugPrint('cwd failed load', this.type); return undefined; }
     if (this.api) { return; }
     try { o = require(p); }
@@ -172,18 +187,14 @@ class serviceEmitter extends EventEmitter {
     return o(this, (!!this.server || !!this.fromServer));
   }
   extendApi(n) {
-    let o, p = findApiExt(this.type, n);
+    let o, p = findApiExt(this.type, n, this.servicePath);
     if (!p) { debugPrint('cwd failed extend', this.type, n); return undefined; }
     if (this.api[n]) { return; }
     try { o = require(p); }
     catch (e) { debugPrint(e.stack); return false; }
-    let api = this.api[n] = { _events: [] };
-    api.on = (n, f) => { api._events.push({ n, f }); this.on(n, f); };
-    api.off = (n, f) => {
-      for (let i = 0, e = api._events, l = e.length; i < l; i++) { if ((e[i].n == n) && (e[i].f == f)) { e.splice(i, 1); i--; l--; } }
-      this.off(n, f);
-    };
-    o(this.api, api, (!!this.server || !!this.fromServer));
+    let api = this.api[n] = new extendedApiBaseClass(this);
+    api = o(this.api, api, (!!this.server || !!this.fromServer));
+    if (api) { this.api[n] = typeof api == 'function' ? new api(this) : api; }
     return true;
   }
   cleanApi(n) {
@@ -250,13 +261,15 @@ serviceEmitter.dataHandler = function (serv, data) {
   function replyFunc(id, m) { this.socket.write(JSON.stringify({ type: 'reply', id, data: m===undefined?false:m }), 'utf8', () => {}); }
   switch (d.type) {
     case 'msg':
-      this.expectsReply = !!d.replyExpected;
       this.handled[d.event] = false;
       this.elFired[d.event] = 0;
       this.emit(d.event, d.data, (...args) => replyFunc.call(this, d.id, ...args));
       break;
     case 'reply':
-      if (this.eventHandlers[`__reply_${d.id}`]) { this.eventHandlers[`__reply_${d.id}`](d.data); }
+      if (this.eventHandlers[`__reply_${d.id}`]) {
+        this.eventHandlers[`__reply_${d.id}`](d.data);
+        delete this.eventHandlers[`__reply_${d.id}`];
+      }
       break;
     case 'stop':
       if (serv) { return; }
@@ -277,4 +290,4 @@ serviceEmitter.dataHandler = function (serv, data) {
     default: break;
   }
 };
-module.exports = { serviceEmitter, reparsePath, set debug(v) { debugMode = !!v; } };
+module.exports = { serviceEmitter, reparsePath, set debug(v) { debugMode = !!v; }, extendedApiBaseClass };
